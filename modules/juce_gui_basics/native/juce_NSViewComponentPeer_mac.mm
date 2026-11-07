@@ -299,6 +299,16 @@ public:
 
         setTitle (component.getName());
 
+        if (@available (macOS 14.0, *))
+        {
+            // A view-bound CADisplayLink fires in step with the compositor's frame deadline and follows the
+            // view between screens, including into full screen. The CVDisplayLink is a free-running timer at
+            // the nominal rate, so work started from it can finish right at the deadline and alternately make
+            // and miss it, which shows as dropped frames.
+            viewDisplayLink = [[view displayLinkWithTarget: view selector: displayLinkFiredSelector] retain];
+            [viewDisplayLink addToRunLoop: [NSRunLoop mainRunLoop] forMode: NSRunLoopCommonModes];
+        }
+
         getNativeRealtimeModifiers = []
         {
             if ([NSEvent respondsToSelector: @selector (modifierFlags)])
@@ -310,6 +320,10 @@ public:
 
     ~NSViewComponentPeer() override
     {
+        [viewDisplayLink invalidate];  // the link retains the view
+        [viewDisplayLink release];
+        viewDisplayLink = nil;
+
         scopedObservers.clear();
 
         setOwner (view, nullptr);
@@ -1772,12 +1786,16 @@ public:
     static inline const auto asyncMouseUpSelector   = @selector (asyncMouseUp:);
     static inline const auto becomeKeySelector      = @selector (becomeKey:);
     static inline const auto resignKeySelector      = @selector (resignKey:);
+    static inline const auto displayLinkFiredSelector = @selector (displayLinkFired:);
     JUCE_END_IGNORE_WARNINGS_GCC_LIKE
 
    #if JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS
     std::unique_ptr<CoreGraphicsMetalLayerRenderer> metalRenderer;
     NSUniquePtr<NSObject<CALayerDelegate>> layerDelegate;
    #endif
+
+    // A CADisplayLink on macOS 14+, which then drives onVBlank instead of the shared CVDisplayLinks
+    id viewDisplayLink = nil;
 
 private:
     JUCE_DECLARE_WEAK_REFERENCEABLE (NSViewComponentPeer)
@@ -1820,6 +1838,9 @@ private:
 
             for (const auto& event : mainThreadVBlankEvents)
             {
+                if (owner.viewDisplayLink != nil)
+                    continue;
+
                 if (auto* peerView = owner.view)
                     if (auto* peerWindow = [peerView window])
                         if (event.display == ScopedDisplayLink::getDisplayIdForScreen ([peerWindow screen]))
@@ -2193,6 +2214,13 @@ struct JuceNSViewClass final : public NSViewComponentPeerWrapper<ObjCClass<NSVie
 
         addMethod (@selector (drawRect:),                       [] (id self, SEL, NSRect r)          { callOnOwner (self, &NSViewComponentPeer::drawRect, r); });
         addMethod (@selector (viewDidMoveToWindow),             [] (id self, SEL)                    { callOnOwner (self, &NSViewComponentPeer::viewMovedToWindow); });
+
+        addMethod (NSViewComponentPeer::displayLinkFiredSelector, [] (id self, SEL, id link)
+        {
+            if (@available (macOS 14.0, *))
+                if (auto* owner = getOwner (self))
+                    owner->onVBlank (((CADisplayLink*) link).targetTimestamp);
+        });
         addMethod (@selector (flagsChanged:),                   [] (id self, SEL, NSEvent* ev)       { callOnOwner (self, &NSViewComponentPeer::redirectModKeyChange, ev); });
         addMethod (@selector (mouseMoved:),                     [] (id self, SEL, NSEvent* ev)       { callOnOwner (self, &NSViewComponentPeer::redirectMouseMove,    ev); });
         addMethod (@selector (mouseEntered:),                   [] (id self, SEL, NSEvent* ev)       { callOnOwner (self, &NSViewComponentPeer::redirectMouseEnter,   ev); });
